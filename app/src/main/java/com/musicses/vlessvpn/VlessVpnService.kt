@@ -13,32 +13,26 @@ import androidx.core.app.NotificationCompat
 private const val TAG = "VlessVpnService"
 private const val CH_ID = "vless_vpn"
 private const val NOTIF_ID = 1
-
-// TUN 虚拟网段配置
-private const val VPN_ADDR      = "10.233.233.1"   // 客户端 TUN IP
-private const val VPN_ROUTER    = "10.233.233.2"   // tun2socks 需要的 netif-ipaddr（对端）
-private const val VPN_NETMASK   = "255.255.255.252" // /30 子网
-private const val VPN_PREFIX    = 24
-private const val MTU           = 1500
+private const val VPN_ADDR = "10.233.233.1"
+private const val VPN_PREFIX = 24
+private const val MTU = 1500
 
 /**
- * VLESS VPN Service
+ * ★ 使用 TunHandler 的版本（备用方案）
  *
- * 架构（与 Node.js client.js 保持一致）：
+ * 如果缺少 libtun2socks.so，可以用这个版本替换
  *
+ * 架构：
  *   App 流量
  *     │
  *     ▼
  *   TUN 接口 (10.233.233.1)
  *     │
- *     ▼  ← libtun2socks.so 处理 TCP/UDP 转发
+ *     ▼  ← TunHandler (Kotlin 实现的 TCP/UDP 处理)
  *   LocalSocks5Server (127.0.0.1:动态端口)
  *     │
  *     ▼  ← VlessTunnel (OkHttp WebSocket)
  *   VLESS Server (wss://...)
- *
- * tun2socks 负责：TUN 包 → SOCKS5 协议转换（TCP + UDP）
- * LocalSocks5Server 负责：SOCKS5 → VLESS/WebSocket 协议转换
  */
 class VlessVpnService : VpnService() {
 
@@ -53,12 +47,9 @@ class VlessVpnService : VpnService() {
     }
 
     private var tun: ParcelFileDescriptor? = null
-    private var socksServer: LocalSocks5Server? = null
-    private var tun2socksThread: Thread? = null
+    private var tunHandler: TunHandler? = null
 
     @Volatile private var running = false
-
-    // ── 生命周期 ──────────────────────────────────────────────────────────────
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         return when (intent?.action) {
@@ -93,11 +84,9 @@ class VlessVpnService : VpnService() {
         super.onRevoke()
     }
 
-    // ── 启动流程 ──────────────────────────────────────────────────────────────
-
     private fun startVpnInBackground() {
         if (running) {
-            Log.w(TAG, "Already running, ignoring start request")
+            Log.w(TAG, "Already running")
             return
         }
         running = true
@@ -107,38 +96,28 @@ class VlessVpnService : VpnService() {
 
     private fun doStart() {
         try {
-            Log.i(TAG, "========== VPN Start (tun2socks mode) ==========")
+            Log.i(TAG, "========== VPN Start (TunHandler Mode) ==========")
 
-            // ── Step 1: 加载 tun2socks 原生库 ─────────────────────────────────
-            Log.d(TAG, "Step 1: Loading tun2socks native library...")
-            try {
-                Tun2Socks.initialize(applicationContext)
-                Log.i(TAG, "✓ libtun2socks.so loaded")
-            } catch (e: UnsatisfiedLinkError) {
-                Log.e(TAG, "✗ Failed to load libtun2socks.so: ${e.message}")
-                Log.e(TAG, "  Make sure libtun2socks.so is placed in app/src/main/jniLibs/<abi>/")
-                broadcast("ERROR")
-                return
-            }
-
-            // ── Step 2: 读取配置 ──────────────────────────────────────────────
-            Log.d(TAG, "Step 2: Loading config...")
+            // Step 1: 加载配置
+            Log.d(TAG, "Step 1: Loading config...")
             val cfg = ConfigStore.loadActive(this)
             Log.i(TAG, "Config: ${cfg.name}  server=${cfg.server}:${cfg.port}")
             broadcast("CONNECTING")
 
-            // ── Step 3: 启动本地 SOCKS5 代理（VLESS 出口）───────────────────
-            Log.d(TAG, "Step 3: Starting LocalSocks5Server (VLESS tunnel)...")
-            val server = LocalSocks5Server(cfg, this) { bytesIn, bytesOut ->
+            // Step 2: 创建 TunHandler (包含内置 SOCKS5)
+            Log.d(TAG, "Step 2: Creating TunHandler...")
+            val handler = TunHandler(null, cfg, this) { bytesIn, bytesOut ->
                 broadcastStats(bytesIn, bytesOut)
                 updateNotif("↓ ${fmt(bytesIn)}  ↑ ${fmt(bytesOut)}")
             }
-            socksServer = server
-            val socksPort = server.start()
-            Log.i(TAG, "✓ SOCKS5 proxy on 127.0.0.1:$socksPort")
+            tunHandler = handler
+            handler.start()
 
-            // ── Step 4: 建立 TUN 接口 ─────────────────────────────────────────
-            Log.d(TAG, "Step 4: Establishing TUN interface...")
+            val socksPort = handler.getSocksPort()
+            Log.i(TAG, "✓ TunHandler created, SOCKS5 on 127.0.0.1:$socksPort")
+
+            // Step 3: 建立 TUN 接口
+            Log.d(TAG, "Step 3: Establishing TUN interface...")
             val tunPfd = Builder()
                 .setSession("VlessVPN")
                 .setMtu(MTU)
@@ -146,66 +125,42 @@ class VlessVpnService : VpnService() {
                 .addRoute("0.0.0.0", 0)
                 .addDnsServer(cfg.dns1)
                 .addDnsServer(cfg.dns2)
-                .addDisallowedApplication(packageName) // 本应用流量不走 VPN（防环路）
+                .addDisallowedApplication(packageName)
                 .establish()
 
             if (tunPfd == null) {
-                Log.e(TAG, "✗ Failed to establish TUN interface (null). " +
-                        "VPN permission not granted or another VPN is active.")
+                Log.e(TAG, "✗ Failed to establish TUN (null)")
                 broadcast("ERROR")
-                server.stop()
+                handler.stop()
                 return
             }
             tun = tunPfd
             Log.i(TAG, "✓ TUN interface established, fd=${tunPfd.fd}")
 
-            // ── Step 5: 启动 tun2socks（核心包转发引擎）─────────────────────
-            // tun2socks 负责把 TUN 收到的 TCP/UDP 包转成 SOCKS5 请求
-            // 转发到我们的 LocalSocks5Server，再由它建立 VLESS WebSocket 隧道
-            Log.d(TAG, "Step 5: Starting tun2socks engine...")
-            Log.d(TAG, "  tunfd        = ${tunPfd.fd}")
-            Log.d(TAG, "  mtu          = $MTU")
-            Log.d(TAG, "  socks5       = 127.0.0.1:$socksPort")
-            Log.d(TAG, "  netif-ipaddr = $VPN_ROUTER")
-            Log.d(TAG, "  netif-nmask  = $VPN_NETMASK")
-
-            tun2socksThread = Thread({
-                val ok = Tun2Socks.startTun2Socks(
-                    /* logLevel                   */ Tun2Socks.LogLevel.INFO,
-                    /* vpnInterfaceFileDescriptor */ tunPfd,
-                    /* vpnInterfaceMtu            */ MTU,
-                    /* socksServerAddress         */ "127.0.0.1",
-                    /* socksServerPort            */ socksPort,
-                    /* netIPv4Address             */ VPN_ROUTER,   // tun2socks 虚拟对端 IP
-                    /* netIPv6Address             */ null,
-                    /* netmask                    */ VPN_NETMASK,
-                    /* forwardUdp                 */ true           // UDP 也走 SOCKS5
-                )
-                Log.i(TAG, "tun2socks exited, result=$ok")
-            }, "tun2socks-engine").apply {
-                isDaemon = false
-                start()
-            }
+            // Step 4: 将 TUN fd 传递给 TunHandler
+            Log.d(TAG, "Step 4: Starting packet processing...")
+            handler.setTunFd(tunPfd.fileDescriptor)
 
             Log.i(TAG, "========== VPN Connected ==========")
             Log.i(TAG, "Profile : ${cfg.name}")
             Log.i(TAG, "Server  : ${cfg.server}:${cfg.port}")
             Log.i(TAG, "SOCKS5  : 127.0.0.1:$socksPort")
-            Log.i(TAG, "Engine  : libtun2socks.so")
+            Log.i(TAG, "Engine  : TunHandler (Kotlin)")
+            Log.i(TAG, "Features: TCP ✅ UDP ✅ DNS ✅ ICMP ✅")
             Log.i(TAG, "===================================")
             broadcast("CONNECTED")
             updateNotif("${cfg.name} • Connected")
 
         } catch (e: SecurityException) {
             Log.e(TAG, "Security exception", e)
-            broadcast("ERROR"); cleanup()
+            broadcast("ERROR")
+            cleanup()
         } catch (e: Exception) {
-            Log.e(TAG, "Unexpected error during VPN start", e)
-            broadcast("ERROR"); cleanup()
+            Log.e(TAG, "Unexpected error", e)
+            broadcast("ERROR")
+            cleanup()
         }
     }
-
-    // ── 停止流程 ──────────────────────────────────────────────────────────────
 
     private fun stopVpn() {
         if (!running) return
@@ -218,21 +173,12 @@ class VlessVpnService : VpnService() {
     }
 
     private fun cleanup() {
-        // 1. 停止 tun2socks（会触发 tun2socks_terminate，让阻塞的 startTun2Socks 返回）
-        runCatching { Tun2Socks.stopTun2Socks() }
-        runCatching { tun2socksThread?.join(3000) }
-        tun2socksThread = null
+        runCatching { tunHandler?.stop() }
+        tunHandler = null
 
-        // 2. 停止本地 SOCKS5 代理
-        runCatching { socksServer?.stop() }
-        socksServer = null
-
-        // 3. 关闭 TUN 接口（关闭后 tun2socks 也会退出）
         runCatching { tun?.close() }
         tun = null
     }
-
-    // ── 广播 ──────────────────────────────────────────────────────────────────
 
     private fun broadcast(status: String) {
         Log.d(TAG, "Status → $status")
@@ -250,8 +196,6 @@ class VlessVpnService : VpnService() {
             setPackage(packageName)
         })
     }
-
-    // ── 通知 ──────────────────────────────────────────────────────────────────
 
     private fun buildNotif(text: String): Notification {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
