@@ -2,28 +2,17 @@ package com.musicses.vlessvpn
 
 import android.net.VpnService
 import android.util.Log
-import java.io.InputStream
-import java.io.OutputStream
+import java.io.ByteArrayOutputStream
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 private const val TAG = "SOCKS5"
 
-/**
- * ★ 修复 earlyData 收集时机问题
- *
- * 问题：回复 SOCKS5 成功后用 available() 检查数据，
- * 但 TcpProxy.pendingData flush 有延迟，导致 available()==0，
- * earlyData 始终为空，服务器收到只有 header 就关闭连接。
- *
- * 修复：用短暂等待 + 循环读取，确保能拿到第一批数据：
- * - 最多等待 200ms
- * - 一旦读到数据就停止等待，立即发出
- * - 超时后也继续（earlyData=null，让服务器收到 header 后等客户端发数据）
- */
 class LocalSocks5Server(
     private val cfg: VlessConfig,
     private val vpnService: VpnService? = null,
@@ -31,14 +20,14 @@ class LocalSocks5Server(
 ) {
     private val pool = Executors.newCachedThreadPool()
     private lateinit var srv: ServerSocket
-    private val connCount = AtomicInteger(0)
+    private val connectionCount = AtomicInteger(0)
 
     @Volatile var port: Int = 0
         private set
     @Volatile private var running = false
 
     fun start(): Int {
-        srv = ServerSocket(0, 128, InetAddress.getByName("127.0.0.1"))
+        srv = ServerSocket(0, 256, InetAddress.getByName("127.0.0.1"))
         port = srv.localPort
         running = true
         pool.submit { acceptLoop() }
@@ -51,162 +40,145 @@ class LocalSocks5Server(
         running = false
         runCatching { srv.close() }
         pool.shutdownNow()
-        Log.i(TAG, "SOCKS5 server stopped")
+        pool.awaitTermination(3, TimeUnit.SECONDS)
     }
 
     private fun acceptLoop() {
         while (running) {
             try {
                 val client = srv.accept()
-                val id = connCount.incrementAndGet()
+                val id = connectionCount.incrementAndGet()
                 pool.submit { handleClient(client, id) }
             } catch (e: Exception) {
-                if (running) Log.e(TAG, "Accept error: ${e.message}")
+                if (running) Log.e(TAG, "Accept: ${e.message}")
                 break
             }
         }
     }
 
-    private fun handleClient(sock: Socket, id: Int) {
+    private fun handleClient(sock: Socket, connId: Int) {
+        // ★ 握手阶段用 30s 超时（防止僵死连接）
         sock.tcpNoDelay = true
-        sock.soTimeout = 30_000
+        sock.soTimeout = 30000
+
         val inp = sock.getInputStream()
         val out = sock.getOutputStream()
 
         try {
-            // ── Step 1: SOCKS5 greeting ──────────────────────────────────────
-            val ver = inp.read()
-            if (ver != 5) { Log.w(TAG, "[$id] Not SOCKS5 (ver=$ver)"); return }
-            val nMethods = inp.read()
-            repeat(nMethods) { inp.read() }
-            out.write(byteArrayOf(0x05, 0x00))
-            out.flush()
+            // ── 1. SOCKS5 握手 ──────────────────────────────────────────
+            val greeting = inp.readNBytes(2)
+            if (greeting.size < 2 || greeting[0] != 0x05.toByte()) return
+            inp.readNBytes(greeting[1].toInt() and 0xFF)
+            out.write(byteArrayOf(0x05, 0x00)); out.flush()
 
-            // ── Step 2: CONNECT request ──────────────────────────────────────
-            val v2   = inp.read()
-            val cmd  = inp.read()
-            inp.read() // RSV
-            val atyp = inp.read()
+            // ── 2. CONNECT 请求 ─────────────────────────────────────────
+            val req = inp.readNBytes(4)
+            if (req.size < 4 || req[0] != 0x05.toByte() || req[1] != 0x01.toByte()) return
 
-            if (v2 != 5 || cmd != 1) {
-                Log.w(TAG, "[$id] Bad request v=$v2 cmd=$cmd")
-                return
+            val (destHost, destPort) = when (req[3]) {
+                0x01.toByte() -> InetAddress.getByAddress(inp.readNBytes(4)).hostAddress!! to portOf(inp.readNBytes(2))
+                0x03.toByte() -> String(inp.readNBytes(inp.read())) to portOf(inp.readNBytes(2))
+                0x04.toByte() -> InetAddress.getByAddress(inp.readNBytes(16)).hostAddress!! to portOf(inp.readNBytes(2))
+                else -> return
             }
 
-            val (destHost, destPort) = parseAddress(inp, atyp) ?: run {
-                Log.w(TAG, "[$id] Unknown atyp=$atyp")
-                return
+            Log.i(TAG, "[$connId] CONNECT $destHost:$destPort")
+
+            // 立即回复成功，让客户端开始发数据
+            out.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0)); out.flush()
+
+            // ── 3. 早期数据收集（最多等 200ms）─────────────────────────
+            val earlyData = collectEarlyData(sock, inp, 200)
+            if (earlyData != null) {
+                Log.d(TAG, "[$connId] earlyData (after 200ms): ${earlyData.size}B")
+            } else {
+                Log.d(TAG, "[$connId] No earlyData (waited 200ms)")
             }
 
-            Log.i(TAG, "[$id] CONNECT $destHost:$destPort")
+            Log.d(TAG, "[$connId] Opening VLESS tunnel...")
 
-            // ── Step 3: 回复成功 ──────────────────────────────────────────────
-            out.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
-            out.flush()
-
-            // ── Step 4: 收集 earlyData ────────────────────────────────────────
-            // ★ 关键修复：用带超时的等待，确保能拿到 TcpProxy flush 过来的数据
-            // 最多等 200ms，一旦有数据立即读取
-            val earlyData: ByteArray? = collectEarlyData(inp, id)
-
-            // ── Step 5: 建立 VLESS 隧道 ──────────────────────────────────────
-            Log.d(TAG, "[$id] Opening VLESS tunnel...")
+            // ── 4. 建立 VLESS 隧道 ──────────────────────────────────────
             val tunnel = VlessTunnel(cfg, vpnService)
             var connected = false
-            val latch = java.util.concurrent.CountDownLatch(1)
+            val latch = CountDownLatch(1)
 
             tunnel.connect(destHost, destPort, earlyData) { ok ->
                 connected = ok
                 latch.countDown()
             }
 
-            if (!latch.await(15, java.util.concurrent.TimeUnit.SECONDS) || !connected) {
-                Log.e(TAG, "[$id] Tunnel connect failed/timeout")
+            if (!latch.await(30, TimeUnit.SECONDS)) {
+                Log.e(TAG, "[$connId] Tunnel timeout (30s)")
+                tunnel.close()
+                return
+            }
+            if (!connected) {
+                Log.e(TAG, "[$connId] Tunnel failed")
                 tunnel.close()
                 return
             }
 
-            Log.i(TAG, "[$id] ✓ Tunnel ready, relaying...")
+            Log.i(TAG, "[$connId] ✓ Tunnel ready, relaying...")
+
+            // ★ 关键修复：relay 前清除 soTimeout
+            // 握手阶段 soTimeout=30000 是必要的（防止僵死）
+            // 但 relay 阶段本地可能长时间无数据（正常情况，如等待服务器响应）
+            // soTimeout 会导致 "Read timed out"，中断正常连接
+            // 改为 0 = 无限等待，由 VlessTunnel 内部的 inQueue.poll(60s) 控制超时
+            sock.soTimeout = 0
+
+            // ── 5. 双向中继 ──────────────────────────────────────────────
             tunnel.relay(inp, out)
-            Log.d(TAG, "[$id] Relay ended")
+
+            Log.d(TAG, "[$connId] Relay ended")
 
         } catch (e: Exception) {
-            Log.d(TAG, "[$id] Error: ${e.message}")
+            if (running) Log.d(TAG, "[$connId] ${e.javaClass.simpleName}: ${e.message}")
         } finally {
             runCatching { sock.close() }
         }
     }
 
     /**
-     * ★ 可靠的 earlyData 收集
-     *
-     * 策略：
-     * 1. 先检查 available()，如果立即有数据就读
-     * 2. 没有的话，等待最多 200ms（分10次，每次20ms）
-     * 3. 一旦有数据立即读取并返回
-     * 4. 超时返回 null
-     *
-     * 200ms 足够 TcpProxy 完成 SOCKS5 握手后 flush pendingData
+     * 定时收集早期数据（50ms 轮询，200ms 超时）
+     * 与 Node.js sock.once('data') + setTimeout(200) 行为一致
      */
-    private fun collectEarlyData(inp: InputStream, id: Int): ByteArray? {
-        // 先尝试立即读
-        if (inp.available() > 0) {
-            val data = ByteArray(inp.available())
-            val n = inp.read(data)
-            if (n > 0) {
-                Log.d(TAG, "[$id] earlyData (immediate): ${n}B")
-                return data.copyOf(n)
-            }
-        }
+    private fun collectEarlyData(sock: Socket, inp: java.io.InputStream, timeoutMs: Long): ByteArray? {
+        val buf = ByteArray(8192)
+        val collected = ByteArrayOutputStream()
+        val deadline = System.currentTimeMillis() + timeoutMs
 
-        // 等待最多 200ms，分批检查
-        val maxWaitMs = 200L
-        val stepMs    = 20L
-        val steps     = (maxWaitMs / stepMs).toInt()
+        // 用短超时轮询，避免阻塞
+        sock.soTimeout = 50
 
-        for (i in 0 until steps) {
-            Thread.sleep(stepMs)
-            if (inp.available() > 0) {
-                val data = ByteArray(inp.available())
-                val n = inp.read(data)
-                if (n > 0) {
-                    Log.d(TAG, "[$id] earlyData (after ${(i + 1) * stepMs}ms): ${n}B")
-                    return data.copyOf(n)
+        try {
+            while (System.currentTimeMillis() < deadline) {
+                try {
+                    val n = inp.read(buf)
+                    if (n < 0) break
+                    if (n > 0) {
+                        collected.write(buf, 0, n)
+                        // 收到数据后，立即尝试读取更多（非阻塞）
+                        try {
+                            while (inp.available() > 0) {
+                                val m = inp.read(buf)
+                                if (m > 0) collected.write(buf, 0, m) else break
+                            }
+                        } catch (_: Exception) {}
+                        break
+                    }
+                } catch (_: java.net.SocketTimeoutException) {
+                    // 继续等待
                 }
             }
+        } catch (e: Exception) {
+            Log.d(TAG, "collectEarlyData: ${e.message}")
         }
+        // 注意：这里不恢复 soTimeout，由调用方在 relay 前设置为 0
 
-        Log.d(TAG, "[$id] No earlyData (waited ${maxWaitMs}ms)")
-        return null
+        return if (collected.size() > 0) collected.toByteArray() else null
     }
 
-    private fun parseAddress(inp: InputStream, atyp: Int): Pair<String, Int>? {
-        return when (atyp) {
-            0x01 -> {
-                val ip = ByteArray(4).also { readFully(inp, it) }
-                InetAddress.getByAddress(ip).hostAddress!! to readPort(inp)
-            }
-            0x03 -> {
-                val len = inp.read()
-                val domain = String(ByteArray(len).also { readFully(inp, it) })
-                domain to readPort(inp)
-            }
-            0x04 -> {
-                val ip = ByteArray(16).also { readFully(inp, it) }
-                InetAddress.getByAddress(ip).hostAddress!! to readPort(inp)
-            }
-            else -> null
-        }
-    }
-
-    private fun readFully(inp: InputStream, buf: ByteArray) {
-        var offset = 0
-        while (offset < buf.size) {
-            val n = inp.read(buf, offset, buf.size - offset)
-            if (n < 0) throw java.io.EOFException("closed at $offset/${buf.size}")
-            offset += n
-        }
-    }
-
-    private fun readPort(inp: InputStream): Int = (inp.read() shl 8) or inp.read()
+    private fun portOf(b: ByteArray) =
+        ((b[0].toInt() and 0xFF) shl 8) or (b[1].toInt() and 0xFF)
 }
