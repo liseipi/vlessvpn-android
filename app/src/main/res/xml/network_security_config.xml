@@ -1,20 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
-    <!-- 允许 VLESS 服务器的连接（包括自签名证书） -->
-    <domain-config cleartextTrafficPermitted="false">
-        <domain includeSubdomains="true">vs.musicses.vip</domain>
-        <trust-anchors>
-            <!-- 信任系统证书 -->
-            <certificates src="system" />
-            <!-- 信任用户安装的证书（用于自签名） -->
-            <certificates src="user" />
-        </trust-anchors>
+    <!-- 允许本地 SOCKS5 代理使用明文 -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
     </domain-config>
 
-    <!-- 默认配置：禁止明文流量 -->
+    <!-- 默认：信任系统证书 + 用户安装的证书（支持自签名），禁止明文 -->
     <base-config cleartextTrafficPermitted="false">
         <trust-anchors>
             <certificates src="system" />
+            <certificates src="user" />
         </trust-anchors>
     </base-config>
 </network-security-config>
